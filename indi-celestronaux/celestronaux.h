@@ -55,6 +55,7 @@ class CelestronAUX :
 
         virtual const char *getDefaultName() override;
         ln_hrz_posn AltAzFromRaDec(double ra, double dec, double ts);
+        ln_equ_posn RaDecFromAltAz(double alt, double az);
 
         virtual bool Sync(double ra, double dec) override;
         virtual bool Goto(double ra, double dec) override;
@@ -102,6 +103,9 @@ class CelestronAUX :
         // mount type
         MountType_t requestedMountType;
         MountType_t currentMountType;
+
+        bool pastAlignmentSubsystemStatus = true;
+        bool currentAlignmentSubsystemStatus;
     
         enum ScopeStatus_t
         {
