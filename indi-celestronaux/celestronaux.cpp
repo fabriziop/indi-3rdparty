@@ -984,18 +984,21 @@ bool CelestronAUX::trackingRequested()
 /////////////////////////////////////////////////////////////////////////////////////
 ///
 /////////////////////////////////////////////////////////////////////////////////////
-bool CelestronAUX::ReadScopeStatus()
+ln_equ_posn CelestronAUX::RaDecFromAltAz(double alt, double az)
 {
     TelescopeDirectionVector TDV;
-    struct ln_equ_posn RaDec;
-    struct ln_hrz_posn AltAz;
-    double RightAscension, Declination;
+    struct ln_equ_posn RaDec {0, 0};
+    struct ln_hrz_posn AltAz {0, 0};
 
     if (MountTypeS[MOUNT_EQUATORIAL].s == ISS_ON)
     {
-        RaDec.ra   = double(GetAZ()) / STEPS_PER_DEGREE;
-        RaDec.dec  = double(GetALT()) / STEPS_PER_DEGREE;
+        RaDec.ra   = az;
+        RaDec.dec  = alt;
         TDV = TelescopeDirectionVectorFromLocalHourAngleDeclination(RaDec);
+ 
+        if (TraceThisTick)
+            DEBUGF(DBG_CAUX, "ReadScopeStatus - RA %lf deg ; Dec %lf deg", RaDec.ra, RaDec.dec);
+
     }
     else
     {
@@ -1007,15 +1010,16 @@ bool CelestronAUX::ReadScopeStatus()
         // controller (That would involve adding 180deg here to the azimuth -
         // this way the celestron nexstar driver and this would agree in some
         // situations but not in other - better not to attepmpt impossible!).
-        AltAz.az  = double(GetAZ()) / STEPS_PER_DEGREE;
-        AltAz.alt = double(GetALT()) / STEPS_PER_DEGREE;
+        AltAz.az  = az;
+        AltAz.alt = alt;
         TDV = TelescopeDirectionVectorFromAltitudeAzimuth(AltAz);
+ 
+        if (TraceThisTick)
+            DEBUGF(DBG_CAUX, "ReadScopeStatus - Alt %lf deg ; Az %lf deg", AltAz.alt, AltAz.az);
+
     }
 
-    if (TraceThisTick)
-        DEBUGF(DBG_CAUX, "ReadScopeStatus - Alt %lf deg ; Az %lf deg", AltAz.alt, AltAz.az);
-
-    if (!TransformTelescopeToCelestial(TDV, RightAscension, Declination))
+    if (!TransformTelescopeToCelestial(TDV, RaDec.ra, RaDec.dec))
     {
         if (TraceThisTick)
             DEBUG(DBG_CAUX, "ReadScopeStatus - TransformTelescopeToCelestial failed");
@@ -1030,7 +1034,7 @@ bool CelestronAUX::ReadScopeStatus()
             Position.lng = IUFindNumber(&LocationNP, "LONG")->value;
             HavePosition = true;
         }
-        struct ln_equ_posn EquatorialCoordinates;
+
         if (HavePosition)
         {
             if (TraceThisTick)
@@ -1064,7 +1068,7 @@ bool CelestronAUX::ReadScopeStatus()
             if (TraceThisTick)
                 DEBUGF(DBG_CAUX, "After rotations: Alt %lf deg ; Az %lf deg", AltAz.alt, AltAz.az);
 
-            ln_get_equ_from_hrz(&AltAz, &Position, ln_get_julian_from_sys(), &EquatorialCoordinates);
+            ln_get_equ_from_hrz(&AltAz, &Position, ln_get_julian_from_sys(), &RaDec);
         }
         else
         {
@@ -1072,20 +1076,35 @@ bool CelestronAUX::ReadScopeStatus()
                 DEBUG(DBG_CAUX, "ReadScopeStatus - HavePosition false");
 
             // The best I can do is just do a direct conversion to RA/DEC
-            EquatorialCoordinatesFromTelescopeDirectionVector(TDV, EquatorialCoordinates);
+            EquatorialCoordinatesFromTelescopeDirectionVector(TDV, RaDec);
         }
+
         // libnova works in decimal degrees
-        RightAscension = EquatorialCoordinates.ra * 24.0 / 360.0;
-        Declination    = EquatorialCoordinates.dec;
+        RaDec.ra *= 24.0 / 360.0;
     }
 
     if (TraceThisTick)
-        DEBUGF(DBG_CAUX, "ReadScopeStatus - RA %lf hours DEC %lf degrees", RightAscension, Declination);
+        DEBUGF(DBG_CAUX, "ReadScopeStatus - RA %lf hours DEC %lf degrees", RaDec.ra, RaDec.dec);
+
+    return RaDec;
+}
+
+
+
+/////////////////////////////////////////////////////////////////////////////////////
+///
+/////////////////////////////////////////////////////////////////////////////////////
+bool CelestronAUX::ReadScopeStatus()
+{
+    double Az  = double(GetAZ()) / STEPS_PER_DEGREE;
+    double Alt = double(GetALT()) / STEPS_PER_DEGREE;
+
+    ln_equ_posn RaDec = RaDecFromAltAz(Alt, Az);
 
     // In case we are slewing while tracking update the potential target
-    NewTrackingTarget.ra  = RightAscension;
-    NewTrackingTarget.dec = Declination;
-    NewRaDec(RightAscension, Declination);
+    NewTrackingTarget.ra  = RaDec.ra;
+    NewTrackingTarget.dec = RaDec.dec;
+    NewRaDec(RaDec.ra, RaDec.dec);
 
     return true;
 }
@@ -1156,6 +1175,13 @@ void CelestronAUX::TimerHit()
         TraceThisTick      = true;
         TraceThisTickCount = 0;
     }
+
+    // issue a SYNC warning when alignment subsystem is set to disabled
+    currentAlignmentSubsystemStatus = IsAlignmentSubsystemActive();
+    if (pastAlignmentSubsystemStatus && !currentAlignmentSubsystemStatus)
+        LOG_WARN("Alignment Subsystem is NOT active: SYNC will be ignored.");
+    pastAlignmentSubsystemStatus = currentAlignmentSubsystemStatus;
+
     // Simulate mount movement
 
     static struct timeval ltv; // previous system time
