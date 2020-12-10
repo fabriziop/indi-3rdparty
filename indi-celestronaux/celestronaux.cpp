@@ -132,8 +132,9 @@ CelestronAUX::CelestronAUX()
       DBG_AUXMOUNT(INDI::Logger::getInstance().addDebugLevel("Celestron AUX Verbose", "CAUX"))
 {
     setVersion(CAUX_VERSION_MAJOR, CAUX_VERSION_MINOR);
-    SetTelescopeCapability(TELESCOPE_CAN_PARK | TELESCOPE_CAN_SYNC | TELESCOPE_CAN_GOTO | TELESCOPE_CAN_ABORT |
-                           TELESCOPE_HAS_TIME | TELESCOPE_HAS_LOCATION, 4);
+    SetTelescopeCapability(TELESCOPE_CAN_PARK | TELESCOPE_CAN_SYNC |
+        TELESCOPE_CAN_GOTO | TELESCOPE_CAN_ABORT | TELESCOPE_HAS_TIME |
+	TELESCOPE_HAS_LOCATION, 4);
 
     LOG_INFO("Celestron AUX instancing");
 
@@ -197,7 +198,9 @@ bool CelestronAUX::Abort()
     AUXCommand stopAlt(MC_MOVE_POS, APP, ALT, b);
     AUXCommand stopAz(MC_MOVE_POS, APP, AZM, b);
     sendCmd(stopAlt);
+    readMsgs(stopAlt);
     sendCmd(stopAz);
+    readMsgs(stopAz);
 
     AbortSP.s = IPS_OK;
     IUResetSwitch(&AbortSP);
@@ -591,7 +594,17 @@ bool CelestronAUX::initProperties()
     IUFillText(&FirmwareT[FW_GPS], "GPS version", "", nullptr);
     IUFillTextVector(&FirmwareTP, FirmwareT, 9, getDeviceName(), "Firmware Info", "", MOUNTINFO_TAB, IP_RO, 0,
                      IPS_IDLE);
+    // mount type
+    IUFillSwitch(&MountTypeS[EQUATORIAL], "EQUATORIAL", "Equatorial", ISS_OFF);
+    IUFillSwitch(&MountTypeS[ALTAZ], "ALTAZ", "AltAz", ISS_ON);
+    IUFillSwitchVector(&MountTypeSP, MountTypeS, 2, getDeviceName(),
+      "MOUNT_TYPE", "Mount Type", MOUNTINFO_TAB, IP_RW, ISR_1OFMANY, 60,
+      IPS_IDLE );
 
+    currentMountType = IUFindOnSwitchIndex(&MountTypeSP) ? ALTAZ : EQUATORIAL;
+    SetApproximateMountAlignmentFromMountType(currentMountType);
+
+    // cord wrap
     IUFillSwitch(&CordWrapS[CORDWRAP_OFF], "CORDWRAP_OFF", "OFF", ISS_OFF);
     IUFillSwitch(&CordWrapS[CORDWRAP_ON], "CORDWRAP_ON", "ON", ISS_ON);
     IUFillSwitchVector(&CordWrapSP, CordWrapS, 2, getDeviceName(), "CORDWRAP", "Cord Wrap", MOTION_TAB, IP_RW, ISR_1OFMANY, 60,
@@ -632,6 +645,8 @@ bool CelestronAUX::updateProperties()
 
     if (isConnected())
     {
+        defineSwitch(&MountTypeSP);
+
         defineSwitch(&CordWrapSP);
         getCordwrap();
         IUResetSwitch(&CordWrapSP);
@@ -662,6 +677,7 @@ bool CelestronAUX::updateProperties()
     }
     else
     {
+        deleteProperty(MountTypeSP.name);
         deleteProperty(CordWrapSP.name);
         deleteProperty(CWPosSP.name);
         deleteProperty(GPSEmuSP.name);
@@ -678,6 +694,7 @@ bool CelestronAUX::saveConfigItems(FILE *fp)
     INDI::Telescope::saveConfigItems(fp);
     SaveAlignmentConfigProperties(fp);
 
+    IUSaveConfigSwitch(fp, &MountTypeSP);
     IUSaveConfigSwitch(fp, &CordWrapSP);
     IUSaveConfigSwitch(fp, &CWPosSP);
     IUSaveConfigSwitch(fp, &GPSEmuSP);
@@ -736,6 +753,34 @@ bool CelestronAUX::ISNewSwitch(const char *dev, const char *name, ISState *state
 {
     if (strcmp(dev, getDeviceName()) == 0)
     {
+       // mount type
+       if (strcmp(name, MountTypeSP.name) == 0)
+        {
+            if (IUUpdateSwitch(&MountTypeSP, states, names, n) < 0)
+                return false;
+
+            MountTypeSP.s = IPS_OK;
+            IDSetSwitch(&MountTypeSP, nullptr);
+
+            requestedMountType =
+                IUFindOnSwitchIndex(&MountTypeSP) ? ALTAZ : EQUATORIAL;
+
+            if (requestedMountType < 0)
+                return false;
+
+            // If nothing changed, return
+            if (requestedMountType == currentMountType)
+                return true;
+
+            currentMountType = requestedMountType;
+
+            LOGF_INFO("update mount: mount type %d", currentMountType);
+
+	    SetApproximateMountAlignmentFromMountType(currentMountType);
+
+            return true;
+        }
+ 
         // Slew mode
         if (!strcmp(name, SlewRateSP.name))
         {
@@ -941,20 +986,31 @@ bool CelestronAUX::trackingRequested()
 /////////////////////////////////////////////////////////////////////////////////////
 bool CelestronAUX::ReadScopeStatus()
 {
+    TelescopeDirectionVector TDV;
+    struct ln_equ_posn RaDec;
     struct ln_hrz_posn AltAz;
     double RightAscension, Declination;
 
-    AltAz.alt = double(GetALT()) / STEPS_PER_DEGREE;
-    // libnova indexes Az from south while Celestron controllers index from north
-    // Never mix two controllers/drivers they will never agree perfectly.
-    // Furthermore the celestron hand controler resets the position encoders
-    // on alignment and this will mess-up all orientation in the driver.
-    // Here we are not attempting to make the driver agree with the hand
-    // controller (That would involve adding 180deg here to the azimuth -
-    // this way the celestron nexstar driver and this would agree in some
-    // situations but not in other - better not to attepmpt impossible!).
-    AltAz.az                     = double(GetAZ()) / STEPS_PER_DEGREE;
-    TelescopeDirectionVector TDV = TelescopeDirectionVectorFromAltitudeAzimuth(AltAz);
+    if (MountTypeS[MOUNT_EQUATORIAL].s == ISS_ON)
+    {
+        RaDec.ra   = double(GetAZ()) / STEPS_PER_DEGREE;
+        RaDec.dec  = double(GetALT()) / STEPS_PER_DEGREE;
+        TDV = TelescopeDirectionVectorFromLocalHourAngleDeclination(RaDec);
+    }
+    else
+    {
+        // libnova indexes Az from south while Celestron controllers index from north
+        // Never mix two controllers/drivers they will never agree perfectly.
+        // Furthermore the celestron hand controler resets the position encoders
+        // on alignment and this will mess-up all orientation in the driver.
+        // Here we are not attempting to make the driver agree with the hand
+        // controller (That would involve adding 180deg here to the azimuth -
+        // this way the celestron nexstar driver and this would agree in some
+        // situations but not in other - better not to attepmpt impossible!).
+        AltAz.az  = double(GetAZ()) / STEPS_PER_DEGREE;
+        AltAz.alt = double(GetALT()) / STEPS_PER_DEGREE;
+        TDV = TelescopeDirectionVectorFromAltitudeAzimuth(AltAz);
+    }
 
     if (TraceThisTick)
         DEBUGF(DBG_CAUX, "ReadScopeStatus - Alt %lf deg ; Az %lf deg", AltAz.alt, AltAz.az);
@@ -1039,16 +1095,31 @@ bool CelestronAUX::ReadScopeStatus()
 /////////////////////////////////////////////////////////////////////////////////////
 bool CelestronAUX::Sync(double ra, double dec)
 {
-    struct ln_hrz_posn AltAz;
-    AltAz.alt = double(GetALT()) / STEPS_PER_DEGREE;
-    AltAz.az  = double(GetAZ()) / STEPS_PER_DEGREE;
-
     AlignmentDatabaseEntry NewEntry;
+    struct ln_equ_posn RaDec { 0, 0 };
+    struct ln_hrz_posn AltAz { 0, 0 };
+
+    if (MountTypeS[MOUNT_EQUATORIAL].s == ISS_ON)
+    {
+        RaDec.ra   = double(GetAZ()) / STEPS_PER_DEGREE;
+        RaDec.dec  = double(GetALT()) / STEPS_PER_DEGREE;
+    }
+    else
+    {
+        AltAz.az  = double(GetAZ()) / STEPS_PER_DEGREE;
+        AltAz.alt = double(GetALT()) / STEPS_PER_DEGREE;
+    }
+
     NewEntry.ObservationJulianDate = ln_get_julian_from_sys();
     NewEntry.RightAscension        = ra;
     NewEntry.Declination           = dec;
-    NewEntry.TelescopeDirection    = TelescopeDirectionVectorFromAltitudeAzimuth(AltAz);
-    NewEntry.PrivateDataSize       = 0;
+
+    if (MountTypeS[MOUNT_EQUATORIAL].s == ISS_ON)
+        NewEntry.TelescopeDirection = TelescopeDirectionVectorFromLocalHourAngleDeclination(RaDec);
+    else
+        NewEntry.TelescopeDirection = TelescopeDirectionVectorFromAltitudeAzimuth(AltAz);
+
+    NewEntry.PrivateDataSize = 0;
 
     DEBUGF(DBG_CAUX, "Sync - Celestial reference frame target right ascension %lf(%lf) declination %lf",
            ra * 360.0 / 24.0, ra, dec);
@@ -2156,7 +2227,6 @@ bool CelestronAUX::tty_set_speed(int PortFD, speed_t speed)
         LOGF_ERROR("Error setting tty attributes %s(%d).\n", strerror(errno), errno);
         return false;
     }
-
 
     return true;
 }
